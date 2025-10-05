@@ -1,9 +1,8 @@
 import Foundation
 import WebKit
 import Combine
-import SwiftUI
 
-// MARK: - Main Activation Manager
+// MARK: - Main Activation Manager (Production Ready)
 @MainActor
 final class ActivationManager: NSObject, ObservableObject {
     
@@ -16,64 +15,82 @@ final class ActivationManager: NSObject, ObservableObject {
     @Published var currentProduct: Product?
     @Published var errorMessage: String?
     @Published var activationProgress: Double = 0.0
-    @Published var diagnosticResults: DiagnosticResults?
     @Published var bundleProgress: BundleProgress?
     
-    // MARK: - WebView Components
-    private var webView: WKWebView?
-    private var hiddenWebView: WKWebView? // For token capture
-    private var conversionWebView: WKWebView? // For conversion handling
+    // MARK: - WebView Management
+    private var hiddenWebView: WKWebView?
+    private var conversionWebView: WKWebView?
+    private var formHidingEnabled = false
+    private var lastProcessedURL: String?
     
-    // MARK: - State Management
+    // MARK: - State Management (Matching Chrome Extension)
     private var microsoftToken: String?
     private var tokenContinuation: CheckedContinuation<String, Error>?
     private var conversionContinuation: CheckedContinuation<Bool, Error>?
     private var pendingActivation: PendingActivation?
+    
+    // MARK: - Auth & Proxy Management
+    private var authCache: [String: AuthCacheEntry] = [:]
+    private var pendingRequests: [String: Int] = [:]
+    private var activeProxy: ActiveProxy?
+    private var tokenCache: [String: TokenCacheEntry] = [:]
+    
+    // MARK: - Bundle State (Matching Chrome Extension)
     private var bundleState: BundleActivationState?
-    private var formHidingEnabled = false
-    private var lastProcessedURL: String?
     
     // MARK: - Retry Management
     private var tokenRetryCount = 0
     private var proxyAuthRetryCount: [String: Int] = [:]
-    private var keyValidationRetryCount: [String: Int] = [:]
-    private var keyRedemptionRetryCount: [String: Int] = [:]
     
     // MARK: - Managers
-    private let credentialsManager = CredentialsManager()
-    private let apiManager = ApiManager.shared
-    private let storageManager = StorageManager.shared
-    private let networkManager = NetworkManager.shared
-    private let diagnosticsManager = DiagnosticsManager()
-    private let urlMonitor = URLMonitor()
-    private let externalMessageHandler = ExternalMessageHandler()
-    
-    // MARK: - Timers and Observers
-    private var urlCheckTimer: Timer?
+    private let credentialsManager = CredentialsManager.shared
     private var cleanupTimer: Timer?
-    private var cancellables = Set<AnyCancellable>()
+    private var lastCleanup = Date()
     
-    // MARK: - Constants
+    // MARK: - Storage
+    private var storedProducts: [StoredProduct] = []
+    
+    // MARK: - Constants (From Chrome Extension)
     private struct Constants {
         static let tokenTimeout: TimeInterval = 30
         static let conversionTimeout: TimeInterval = 30
         static let bundleKeyDelay: TimeInterval = 3
         static let maxTokenRetries = 3
-        static let maxProxyAuthRetries = 3
-        static let maxKeyValidationRetries = 3
-        static let maxKeyRedemptionRetries = 2
-        static let gamePassProductIds = ["6001208656029", "6001240703133"]
+        static let maxProxyRetries = 2
+        static let authCacheDuration: TimeInterval = 300
+        static let tokenCacheDuration: TimeInterval = 3600
+        static let gamePassProductIds = ["CFQ7TTC0K5DJ", "CFQ7TTC0KHS0"]
         static let supportWhatsApp = "972557207138"
-        static let supportEmail = "help@exongames.co.il"
-        static let allowedShopifyDomains = ["exongames.co.il", "exon-israel.myshopify.com"]
-        static let microsoftDomains = [
+        static let microsoftTargetHosts = [
             "account.microsoft.com",
-            "login.microsoftonline.com",
-            "login.live.com",
-            "purchase.mp.microsoft.com"
+            "redeem.microsoft.com",
+            "www.microsoft.com",
+            "purchase.mp.microsoft.com",
+            "displaycatalog.mp.microsoft.com",
+            "browser.events.data.microsoft.com"
         ]
-        static let authCacheDuration: TimeInterval = 300 // 5 minutes
-        static let cleanupInterval: TimeInterval = 60 // 1 minute
+        static let allowedShopifyOrigins = [
+            "https://exongames.co.il",
+            "https://exon-israel.myshopify.com"
+        ]
+    }
+    
+    // MARK: - Types
+    struct ActiveProxy {
+        let region: String
+        let host: String
+        let port: Int
+        let startTime: Date
+    }
+    
+    struct AuthCacheEntry {
+        let credentials: URLCredential
+        let expires: Date
+    }
+    
+    struct TokenCacheEntry {
+        let token: String
+        let expires: Date
     }
     
     // MARK: - Initialization
@@ -81,15 +98,13 @@ final class ActivationManager: NSObject, ObservableObject {
         super.init()
         Task { @MainActor in
             setupWebViews()
-            setupObservers()
-            setupTimers()
-            setupExternalMessageHandling()
+            setupCleanupTimer()
+            loadStoredProducts()
         }
     }
     
-    // MARK: - Main Activation Entry Point
-    func startActivation(from source: ActivationSource) async {
-        // Reset state
+    // MARK: - Main Activation Entry Point (Matching Chrome Extension)
+    func startActivation(sessionToken: String) async {
         await resetState()
         
         await MainActor.run {
@@ -100,137 +115,241 @@ final class ActivationManager: NSObject, ObservableObject {
         }
         
         do {
-            // Step 1: Extract activation data based on source
-            let activation = try await extractActivationData(from: source)
-            self.pendingActivation = activation
+            // Step 1: Get product from session (matching Chrome getProductBySessionToken)
+            let product = try await getProductBySessionToken(sessionToken)
             
-            // Step 2: Run diagnostics
             await MainActor.run {
-                self.activationState = .runningDiagnostics
+                self.currentProduct = product
                 self.activationProgress = 0.05
             }
             
-            let diagnostics = await runCompleteDiagnostics()
-            self.diagnosticResults = diagnostics
-            
-            // Check diagnostic results
-            if !diagnostics.cookiesEnabled {
-                throw DiagnosticError.cookiesDisabled
+            // Check for digital account activation method
+            if product.activationMethod == "digital_account" ||
+               product.activationMethod == "Digital Account" {
+                
+                // Generate portal URL if needed
+                if product.portalUrl == nil {
+                    let portalUrl = try await generatePortalURL(
+                        orderId: product.orderId,
+                        orderNumber: product.orderNumber
+                    )
+                    product.portalUrl = portalUrl
+                }
+                
+                await MainActor.run {
+                    self.activationState = .requiresDigitalAccount
+                    self.isActivating = false
+                }
+                return
             }
             
-            if !diagnostics.loggedIn {
-                throw DiagnosticError.notLoggedIn
+            // Store product without duplicates (matching Chrome addProductToStorage)
+            await addProductToStorage(product)
+            
+            // Check if session expired
+            if let expiresAt = product.expiresAt, expiresAt < Date() {
+                await MainActor.run {
+                    self.activationState = .expiredSession
+                    self.isActivating = false
+                }
+                throw ActivationError.sessionExpired
             }
             
-            if !diagnostics.networkAvailable {
-                throw DiagnosticError.noNetwork
+            // Step 2: Validate vendor
+            let vendorCheck = verifyVendorForCurrentPage(product.vendor ?? "Microsoft Store")
+            if !vendorCheck.valid {
+                throw ActivationError.vendorMismatch(
+                    expected: vendorCheck.expected ?? "Microsoft Store",
+                    actual: product.vendor ?? "Unknown"
+                )
             }
             
-            // Step 3: Process activation
-            await processActivationFlow(activation)
+            // Step 3: Check if already redeemed
+            if isKeyRedeemed(product.status) {
+                await MainActor.run {
+                    self.activationState = .alreadyRedeemed
+                    self.isActivating = false
+                }
+                return
+            }
+            
+            // Step 4: Check for Game Pass products
+            if isGamePassProduct(product) {
+                try await performGamePassChecks(product)
+            }
+            
+            // Step 5: Capture Microsoft Token (with retry logic)
+            await MainActor.run {
+                self.activationState = .capturingToken
+                self.activationProgress = 0.3
+            }
+            
+            let token = try await captureTokenWithRetry()
+            self.microsoftToken = token
+            
+            // Step 6: Enable form hiding
+            if !product.isTestMode {
+                await enableFormHiding()
+            }
+            
+            // Step 7: Process activation (bundle or single)
+            if product.isBundle {
+                try await processBundleActivation(product: product, token: token)
+            } else {
+                try await processSingleKeyActivation(product: product, token: token)
+            }
+            
+            // Step 8: Mark as activated
+            try await markAsActivated(sessionToken: sessionToken, success: true)
+            
+            // Step 9: Cleanup
+            await performCleanup()
             
         } catch {
             await handleActivationError(error)
+            
+            // Try to mark as failed
+            try? await markAsActivated(sessionToken: sessionToken, success: false)
         }
     }
     
-    // MARK: - Activation Flow Processing
-    private func processActivationFlow(_ activation: PendingActivation) async throws {
-        // Step 1: Fetch/Enrich Product Data
-        await MainActor.run {
-            self.activationState = .fetchingProduct
-            self.activationProgress = 0.1
+    // MARK: - Get Product By Session Token (Matching Chrome Extension)
+    private func getProductBySessionToken(_ sessionToken: String) async throws -> Product {
+        devLog("[Product] Fetching from database for session: \(sessionToken)")
+        
+        // Fetch session details from Supabase
+        let url = URL(string: "\(Config.supabase.url)/rest/v1/activation_sessions")!
+            .appending(queryItems: [
+                URLQueryItem(name: "session_token", value: "eq.\(sessionToken)"),
+                URLQueryItem(name: "select", value: "session_token,order_id,line_item_id,license_key,license_keys,region,product_name,product_id,product_image,vendor,status,expires_at")
+            ])
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(Config.supabase.anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(Config.supabase.anonKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw ActivationError.invalidSession
         }
         
-        let product = try await fetchAndEnrichProduct(activation)
-        
-        await MainActor.run {
-            self.currentProduct = product
-            self.activationProgress = 0.15
+        let sessions = try JSONDecoder().decode([SessionData].self, from: data)
+        guard let session = sessions.first else {
+            throw ActivationError.sessionNotFound
         }
         
-        // Store product with deduplication
-        await storageManager.saveProduct(product, deduplicate: true)
+        // Check if session expired
+        if let expiresAt = session.expiresAt, Date() > expiresAt {
+            throw ActivationError.sessionExpired
+        }
         
-        // Step 2: Check activation method
-        if product.activationMethod == "digital_account" {
-            await MainActor.run {
-                self.activationState = .requiresDigitalAccount
-                self.isActivating = false
+        // Fetch activation method and order number
+        var activationMethod: String?
+        var orderNumber: String?
+        
+        do {
+            let readinessUrl = URL(string: "\(Config.supabase.url)/rest/v1/line_item_readiness")!
+                .appending(queryItems: [
+                    URLQueryItem(name: "order_id", value: "eq.\(session.orderId)"),
+                    URLQueryItem(name: "line_item_id", value: "eq.\(session.lineItemId)"),
+                    URLQueryItem(name: "select", value: "activation_method,order_number")
+                ])
+            
+            var readinessRequest = URLRequest(url: readinessUrl)
+            readinessRequest.httpMethod = "GET"
+            readinessRequest.setValue(Config.supabase.anonKey, forHTTPHeaderField: "apikey")
+            readinessRequest.setValue("Bearer \(Config.supabase.anonKey)", forHTTPHeaderField: "Authorization")
+            
+            let (readinessData, _) = try await URLSession.shared.data(for: readinessRequest)
+            let readinessInfo = try JSONDecoder().decode([ReadinessData].self, from: readinessData)
+            
+            if let info = readinessInfo.first {
+                activationMethod = info.activationMethod
+                orderNumber = info.orderNumber
             }
-            return
+        } catch {
+            devLog("[Product] Could not fetch activation method, continuing without it")
         }
         
-        // Step 3: Vendor Verification
-        try verifyVendorCompatibility(product.vendor)
-        
-        // Step 4: Validate keys
-        await MainActor.run {
-            self.activationState = .validatingKey
-            self.activationProgress = 0.2
+        // Generate portal URL for digital accounts
+        var portalUrl: String?
+        if activationMethod == "digital_account" || activationMethod == "Digital Account" {
+            portalUrl = try? await generatePortalURL(
+                orderId: session.orderId,
+                orderNumber: orderNumber
+            )
         }
         
-        guard !product.allKeys.isEmpty else {
-            throw ActivationError.noKeys
-        }
+        // Create Product object
+        let product = Product(
+            id: UUID().uuidString,
+            sessionToken: sessionToken,
+            productKey: session.licenseKey,
+            productKeys: session.licenseKeys ?? (session.licenseKey.map { [$0] }),
+            region: session.region ?? "IL",
+            productName: session.productName ?? "Microsoft Product",
+            productImage: session.productImage,
+            productId: session.productId,
+            vendor: session.vendor ?? "Microsoft Store",
+            status: session.status,
+            isBundle: (session.licenseKeys?.count ?? 0) > 1,
+            activationMethod: activationMethod,
+            orderNumber: orderNumber,
+            portalUrl: portalUrl,
+            orderId: session.orderId,
+            expiresAt: session.expiresAt,
+            isTestMode: sessionToken.contains("test")
+        )
         
-        // Check if keys are already redeemed
-        if let status = product.status, isKeyRedeemed(status) {
-            await MainActor.run {
-                self.activationState = .alreadyRedeemed
-                self.isActivating = false
-            }
-            return
-        }
-        
-        // Step 5: Game Pass specific checks
-        if isGamePassProduct(product) {
-            try await performGamePassValidation(product)
-        }
-        
-        // Step 6: Capture Microsoft Token
-        await MainActor.run {
-            self.activationState = .capturingToken
-            self.activationProgress = 0.5
-        }
-        
-        let token = try await captureMicrosoftTokenWithRetry()
-        self.microsoftToken = token
-        
-        // Step 7: Enable form hiding
-        if !activation.isTestMode {
-            await enableFormHiding()
-        }
-        
-        // Step 8: Process keys (single or bundle)
-        if product.isBundle {
-            try await processBundleActivation(product: product, token: token)
-        } else {
-            try await processSingleKeyActivation(product: product, token: token)
-        }
-        
-        // Step 9: Mark as activated in database
-        if let sessionToken = activation.sessionToken {
-            try await markAsActivated(sessionToken: sessionToken)
-        }
-        
-        // Step 10: Cleanup
-        await performCleanup()
+        return product
     }
     
-    // MARK: - Bundle Activation with State Tracking
+    // MARK: - Generate Portal URL (Matching Chrome Extension)
+    private func generatePortalURL(orderId: String, orderNumber: String?) async throws -> String {
+        let url = URL(string: "\(Config.supabase.url)/functions/v1/portal-auth")!
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(Config.supabase.anonKey)", forHTTPHeaderField: "Authorization")
+        
+        let body: [String: Any] = [
+            "action": "create_token_and_redirect",
+            "data": [
+                "order_id": orderId,
+                "order_name": orderNumber ?? "",
+                "source": "ios_digital_account",
+                "customer_email": "",
+                "is_authenticated": false
+            ]
+        ]
+        
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let portalUrl = json["portal_url"] as? String else {
+            throw ActivationError.portalUrlGenerationFailed
+        }
+        
+        devLog("[Product] Portal URL generated for digital account: \(portalUrl)")
+        return portalUrl
+    }
+    
+    // MARK: - Bundle Processing (Matching Chrome Extension)
     private func processBundleActivation(product: Product, token: String) async throws {
+        devLog("[API] Bundle detected with \(product.allKeys.count) keys")
+        
         await MainActor.run {
             self.activationState = .activatingBundle
             self.activationProgress = 0.6
-        }
-        
-        // Initialize bundle state
-        let bundleState = BundleActivationState(keys: product.allKeys)
-        self.bundleState = bundleState
-        
-        // Update UI with bundle progress
-        await MainActor.run {
             self.bundleProgress = BundleProgress(
                 total: product.allKeys.count,
                 completed: 0,
@@ -239,12 +358,13 @@ final class ActivationManager: NSObject, ObservableObject {
             )
         }
         
-        // Process each key with state tracking
+        // Initialize bundle state
+        bundleState = BundleActivationState(keys: product.allKeys)
+        
+        var results: [BundleKeyResult] = []
+        
         for (index, key) in product.allKeys.enumerated() {
-            // Check if key was already processed successfully
-            if bundleState.isKeySuccessful(key) {
-                continue
-            }
+            devLog("[API] Redeeming bundle key \(index + 1)/\(product.allKeys.count)")
             
             // Update progress
             await MainActor.run {
@@ -252,47 +372,17 @@ final class ActivationManager: NSObject, ObservableObject {
                 self.bundleProgress?.currentIndex = index
             }
             
-            // Update key state
-            bundleState.updateKeyState(key, state: .validating)
-            
             do {
-                // Validate key first
-                let validationResult = try await validateKeyWithRetry(
-                    key: key,
-                    token: token,
-                    region: product.region
-                )
-                
-                if !validationResult.isValid {
-                    throw ActivationError.invalidKey
-                }
-                
-                if validationResult.isAlreadyRedeemed {
-                    bundleState.updateKeyState(key, state: .alreadyRedeemed)
-                    bundleState.recordFailure(
-                        key: key,
-                        error: ActivationError.alreadyRedeemed,
-                        isRecoverable: false
-                    )
-                    continue
-                }
-                
-                // Update state to redeeming
-                bundleState.updateKeyState(key, state: .redeeming)
-                
-                // Attempt redemption
-                try await redeemKeyWithRetry(
+                try await redeemSingleKey(
                     key: key,
                     token: token,
                     region: product.region,
                     product: product
                 )
                 
-                // Mark as successful
-                bundleState.updateKeyState(key, state: .succeeded)
-                bundleState.recordSuccess(key: key)
+                results.append(BundleKeyResult(success: true, key: key, result: nil))
+                bundleState?.recordSuccess(key: key)
                 
-                // Update progress
                 await MainActor.run {
                     self.bundleProgress?.succeeded += 1
                     self.bundleProgress?.completed += 1
@@ -300,423 +390,668 @@ final class ActivationManager: NSObject, ObservableObject {
                 }
                 
             } catch {
-                // Handle specific errors
-                let errorInfo = analyzeActivationError(error, key: key)
-                
-                // Update state based on error
-                if errorInfo.isAlreadyOwned {
-                    bundleState.updateKeyState(
-                        key,
-                        state: .alreadyOwned(products: errorInfo.ownedProducts)
-                    )
-                } else if errorInfo.isAlreadyRedeemed {
-                    bundleState.updateKeyState(key, state: .alreadyRedeemed)
-                } else if errorInfo.requiresConversion {
-                    bundleState.updateKeyState(key, state: .conversionRequired)
+                // Special handling for conversion-related errors
+                if error.localizedDescription.contains("Game Pass conversion") {
+                    devLog("[API] Bundle key \(index + 1) requires Game Pass conversion")
                     
-                    // Handle conversion
+                    // Attempt conversion
                     do {
                         try await handleGamePassConversion(
                             key: key,
                             token: token,
                             region: product.region
                         )
-                        bundleState.updateKeyState(key, state: .succeeded)
-                        bundleState.recordSuccess(key: key)
+                        results.append(BundleKeyResult(success: true, key: key, result: nil))
+                        bundleState?.recordSuccess(key: key)
                     } catch {
-                        bundleState.updateKeyState(key, state: .failed(reason: error.localizedDescription))
-                        bundleState.recordFailure(key: key, error: error, isRecoverable: false)
+                        results.append(BundleKeyResult(success: false, key: key, error: error.localizedDescription))
+                        bundleState?.recordFailure(key: key, error: error)
                     }
                 } else {
-                    bundleState.updateKeyState(
-                        key,
-                        state: .failed(reason: errorInfo.message)
-                    )
-                    bundleState.recordFailure(
-                        key: key,
-                        error: error,
-                        isRecoverable: errorInfo.isRecoverable
-                    )
+                    devError("[API] Failed to redeem bundle key \(index + 1): \(error)")
+                    results.append(BundleKeyResult(success: false, key: key, error: error.localizedDescription))
+                    bundleState?.recordFailure(key: key, error: error)
                 }
                 
-                // Update progress
                 await MainActor.run {
                     self.bundleProgress?.failed += 1
                     self.bundleProgress?.completed += 1
                 }
             }
             
-            // Add delay between keys (except for last one)
+            // Wait between redemptions (matching Chrome extension)
             if index < product.allKeys.count - 1 {
-                let delay = calculateBundleKeyDelay(
-                    index: index,
-                    hasFailures: bundleState.hasFailures()
-                )
-                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                devLog("[API] Waiting 3 seconds before next redemption...")
+                try await Task.sleep(nanoseconds: UInt64(Constants.bundleKeyDelay * 1_000_000_000))
             }
         }
         
-        // Process final bundle results
-        await processBundleResults(bundleState: bundleState, product: product)
+        // Process final results
+        await processBundleResults(results: results)
     }
     
-    // MARK: - Single Key Activation
+    // MARK: - Token Capture with Retry (Matching Chrome Extension)
+    private func captureTokenWithRetry() async throws -> String {
+        tokenRetryCount = 0
+        
+        for attempt in 1...Constants.maxTokenRetries {
+            do {
+                tokenRetryCount = attempt
+                
+                // Check cache first (matching Chrome extension)
+                if let cached = getTokenFromCache() {
+                    devLog("[Token] Using cached token")
+                    return cached
+                }
+                
+                devLog("[Token] Capturing new token (attempt \(attempt)/\(Constants.maxTokenRetries))")
+                
+                let token = try await captureToken()
+                
+                // Cache the token
+                cacheToken(token)
+                
+                return token
+                
+            } catch {
+                devError("[Token] Capture error on attempt \(attempt): \(error)")
+                
+                if attempt < Constants.maxTokenRetries {
+                    // Exponential backoff
+                    let delay = pow(2.0, Double(attempt - 1))
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } else {
+                    throw ActivationError.tokenCaptureFailed(error.localizedDescription)
+                }
+            }
+        }
+        
+        throw ActivationError.maxRetriesExceeded
+    }
+
+    private func captureToken() async throws -> String {
+        guard let webView = hiddenWebView else {
+            throw ActivationError.noWebView
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            self.tokenContinuation = continuation
+            
+            // Execute token capture script (matching Chrome extension)
+            let script = """
+            (async function() {
+                try {
+                    const response = await fetch(
+                        'https://account.microsoft.com/auth/acquire-onbehalf-of-token?scopes=MSComServiceMBISSL',
+                        {
+                            method: 'GET',
+                            credentials: 'include',
+                            headers: {
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Accept': 'application/json'
+                            }
+                        }
+                    );
+                    
+                    if (!response.ok) {
+                        throw new Error(`Token request failed: ${response.status}`);
+                    }
+                    
+                    const data = await response.json();
+                    
+                    // Extract token from various response formats
+                    if (Array.isArray(data) && data[0]?.token) {
+                        return data[0].token;
+                    } else if (data?.token) {
+                        return data.token;
+                    }
+                    
+                    throw new Error('Token not found in response');
+                } catch (error) {
+                    throw new Error(`Token capture failed: ${error.message}`);
+                }
+            })();
+            """
+            
+            webView.evaluateJavaScript(script) { result, error in
+                if let token = result as? String {
+                    continuation.resume(returning: token)
+                } else {
+                    continuation.resume(throwing: error ?? ActivationError.noToken)
+                }
+            }
+            
+            // Set timeout
+            Task {
+                try await Task.sleep(nanoseconds: UInt64(Constants.tokenTimeout * 1_000_000_000))
+                if self.tokenContinuation != nil {
+                    self.tokenContinuation?.resume(throwing: ActivationError.tokenTimeout)
+                    self.tokenContinuation = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Single Key Activation (Matching Chrome Extension)
     private func processSingleKeyActivation(product: Product, token: String) async throws {
+        guard let key = product.productKey ?? product.productKeys?.first else {
+            throw ActivationError.noKeys
+        }
+        
         await MainActor.run {
             self.activationState = .activating
             self.activationProgress = 0.7
         }
         
-        guard let key = product.productKey ?? product.productKeys?.first else {
-            throw ActivationError.noKeys
-        }
-        
-        // Validate key
-        let validationResult = try await validateKeyWithRetry(
+        try await redeemSingleKey(
             key: key,
             token: token,
-            region: product.region
+            region: product.region,
+            product: product
         )
         
-        if !validationResult.isValid {
-            throw ActivationError.invalidKey
-        }
-        
-        if validationResult.isAlreadyRedeemed {
-            await MainActor.run {
-                self.activationState = .alreadyRedeemed
-                self.isActivating = false
-            }
-            return
-        }
-        
-        // Attempt redemption
-        do {
-            try await redeemKeyWithRetry(
-                key: key,
-                token: token,
-                region: product.region,
-                product: product
+        await MainActor.run {
+            self.activationState = .success(
+                productName: product.productName,
+                keys: [key]
             )
-            
-            await MainActor.run {
-                self.activationState = .success(
-                    productName: product.productName,
-                    keys: [key]
-                )
-                self.activationProgress = 1.0
-                self.isActivating = false
-            }
-            
-        } catch APIError.conversionConsentRequired {
-            // Handle conversion
-            await MainActor.run {
-                self.activationState = .handlingConversion
-            }
-            
-            try await handleGamePassConversion(
-                key: key,
-                token: token,
-                region: product.region
-            )
-            
-            await MainActor.run {
-                self.activationState = .success(
-                    productName: product.productName,
-                    keys: [key]
-                )
-                self.activationProgress = 1.0
-                self.isActivating = false
-            }
-            
-        } catch APIError.userAlreadyOwnsContent(let products) {
-            await MainActor.run {
-                self.activationState = .alreadyOwned(products: products)
-                self.isActivating = false
-            }
+            self.activationProgress = 1.0
+            self.isActivating = false
         }
     }
-    
-    // MARK: - Key Validation with Retry
-    private func validateKeyWithRetry(
-        key: String,
-        token: String,
-        region: String
-    ) async throws -> KeyValidationResult {
-        
-        let retryCount = keyValidationRetryCount[key] ?? 0
-        
-        if retryCount >= Constants.maxKeyValidationRetries {
-            throw ActivationError.maxRetriesExceeded
-        }
-        
-        keyValidationRetryCount[key] = retryCount + 1
-        
-        return try await networkManager.executeWithExponentialBackoff(
-            maxAttempts: Constants.maxKeyValidationRetries - retryCount,
-            initialDelay: 1.0,
-            maxDelay: 8.0,
-            jitter: true
-        ) {
-            if region == "GLOBAL" || region == "WW" || region == "WORLDWIDE" {
-                return try await self.validateGlobalKey(key: key, token: token)
-            } else {
-                return try await self.validateRegionalKey(
-                    key: key,
-                    token: token,
-                    region: region
-                )
-            }
-        }
-    }
-    
-    // MARK: - Key Redemption with Retry
-    private func redeemKeyWithRetry(
+
+    // MARK: - Key Redemption (Matching Chrome Extension redeemKey)
+    private func redeemSingleKey(
         key: String,
         token: String,
         region: String,
         product: Product
     ) async throws {
         
-        let retryCount = keyRedemptionRetryCount[key] ?? 0
+        let isGlobalKey = ["GLOBAL", "WW", "WORLDWIDE"].contains(region.uppercased())
         
-        if retryCount >= Constants.maxKeyRedemptionRetries {
-            throw ActivationError.maxRetriesExceeded
-        }
-        
-        keyRedemptionRetryCount[key] = retryCount + 1
-        
-        try await networkManager.executeWithExponentialBackoff(
-            maxAttempts: Constants.maxKeyRedemptionRetries - retryCount,
-            initialDelay: 1.0,
-            maxDelay: 4.0,
-            jitter: true
-        ) {
-            if region == "GLOBAL" || region == "WW" || region == "WORLDWIDE" {
-                try await self.redeemGlobalKey(
-                    key: key,
-                    token: token,
-                    productId: product.productId
-                )
-            } else {
-                try await self.redeemRegionalKey(
-                    key: key,
-                    token: token,
-                    region: region,
-                    productId: product.productId
-                )
-            }
+        if isGlobalKey {
+            try await redeemGlobalKey(key: key, token: token)
+        } else {
+            try await redeemRegionalKey(
+                key: key,
+                token: token,
+                region: region,
+                product: product
+            )
         }
     }
-    
-    // MARK: - Regional Key Validation
-    private func validateRegionalKey(
+
+    // MARK: - Global Key Redemption (No Proxy)
+    private func redeemGlobalKey(key: String, token: String) async throws {
+        devLog("[API] Redeeming GLOBAL key (no proxy needed)")
+        
+        // Step 1: Validate key
+        let validationUrl = URL(string: "https://purchase.mp.microsoft.com/v7.0/tokenDescriptions/\(key)?market=US&language=en-US&supportMultiAvailabilities=true")!
+        
+        var validateRequest = URLRequest(url: validationUrl)
+        validateRequest.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
+        validateRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        
+        let (validateData, validateResponse) = try await URLSession.shared.data(for: validateRequest)
+        
+        guard let httpValidateResponse = validateResponse as? HTTPURLResponse else {
+            throw ActivationError.networkError
+        }
+        
+        switch httpValidateResponse.statusCode {
+        case 401: throw ActivationError.authenticationFailed
+        case 404: throw ActivationError.invalidKey
+        case 400: throw ActivationError.alreadyRedeemed
+        case 200: break
+        default: throw ActivationError.validationFailed
+        }
+        
+        let validationData = try JSONSerialization.jsonObject(with: validateData) as? [String: Any]
+        
+        if let tokenState = validationData?["tokenState"] as? String,
+           tokenState != "Active" {
+            throw ActivationError.keyStateInvalid(tokenState)
+        }
+        
+        // Step 2: Redeem key
+        let redeemUrl = URL(string: "https://purchase.mp.microsoft.com/v7.0/users/me/orders")!
+        
+        var redeemRequest = URLRequest(url: redeemUrl)
+        redeemRequest.httpMethod = "POST"
+        redeemRequest.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
+        redeemRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let payload = createRedemptionPayload(key: key, market: "US")
+        redeemRequest.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (redeemData, redeemResponse) = try await URLSession.shared.data(for: redeemRequest)
+        
+        try await handleRedemptionResponse(
+            response: redeemResponse,
+            data: redeemData,
+            key: key,
+            token: token,
+            region: "GLOBAL"
+        )
+        
+        devLog("[API] GLOBAL key redemption successful")
+    }
+
+    // MARK: - Regional Key Redemption (With Proxy)
+    private func redeemRegionalKey(
         key: String,
         token: String,
-        region: String
-    ) async throws -> KeyValidationResult {
+        region: String,
+        product: Product
+    ) async throws {
         
-        // Get proxy configuration
-        guard let proxyConfig = ProxyConfiguration.getConfig(for: region) else {
+        let targetRegion = region.uppercased()
+        guard let config = ProxyConfiguration.regions[targetRegion] else {
             throw ActivationError.unsupportedRegion
         }
         
-        // Get fresh credentials
+        devLog("[API] Redeeming key in \(targetRegion)")
+        
+        // Get proxy credentials
         let credentials = try await credentialsManager.getCredentials()
         
+        // Enable proxy
+        try await enableProxy(region: targetRegion, credentials: credentials)
+        
+        defer {
+            Task {
+                await disableProxy()
+            }
+        }
+        
         // Create proxy session
-        let session = try await createProxySession(
-            config: proxyConfig,
+        let proxySession = createProxySession(
+            config: config,
             credentials: credentials
         )
         
-        defer { session.finishTasksAndInvalidate() }
-        
-        // Try primary market first
-        var result = try? await validateKeyInMarket(
-            key: key,
-            token: token,
-            market: proxyConfig.market,
-            session: session
-        )
-        
-        // If catalog not found, try US market
-        if result == nil || result?.catalogError == true {
-            result = try await validateKeyInMarket(
+        // Try regional market first, then fall back to US
+        do {
+            try await redeemWithMarket(
+                key: key,
+                token: token,
+                market: config.market,
+                session: proxySession
+            )
+        } catch APIError.catalogNotFound {
+            devLog("[API] Product not in catalog for \(config.market) region, trying US market catalog")
+            
+            try await redeemWithMarket(
                 key: key,
                 token: token,
                 market: "US",
-                session: session
+                session: proxySession
+            )
+        } catch APIError.marketMismatch {
+            devLog("[API] ActiveMarketMismatch detected, retrying with US market while keeping proxy")
+            
+            try await redeemWithMarket(
+                key: key,
+                token: token,
+                market: "US",
+                session: proxySession
             )
         }
         
-        guard let validationResult = result else {
-            throw ActivationError.validationFailed
-        }
-        
-        return validationResult
+        devLog("[API] Redemption successful")
     }
-    
-    // MARK: - Global Key Validation
-    private func validateGlobalKey(
-        key: String,
-        token: String
-    ) async throws -> KeyValidationResult {
-        
-        return try await validateKeyInMarket(
-            key: key,
-            token: token,
-            market: "US",
-            session: URLSession.shared
-        )
-    }
-    
-    // MARK: - Market-specific Validation
-    private func validateKeyInMarket(
+
+    // MARK: - Market-Specific Redemption
+    private func redeemWithMarket(
         key: String,
         token: String,
         market: String,
         session: URLSession
-    ) async throws -> KeyValidationResult {
+    ) async throws {
         
-        let url = URL(string: "https://purchase.mp.microsoft.com/v7.0/tokenDescriptions/\(key)?market=\(market)&language=en-US&supportMultiAvailabilities=true")!
+        // Step 1: Validate
+        let validateUrl = URL(string: "https://purchase.mp.microsoft.com/v7.0/tokenDescriptions/\(key)?market=\(market)&language=en-US&supportMultiAvailabilities=true")!
         
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        var validateRequest = URLRequest(url: validateUrl)
+        validateRequest.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
+        validateRequest.setValue("application/json", forHTTPHeaderField: "Accept")
         
-        let (data, response) = try await session.data(for: request)
+        let (validateData, validateResponse) = try await session.data(for: validateRequest)
+        
+        guard let httpValidateResponse = validateResponse as? HTTPURLResponse else {
+            throw ActivationError.networkError
+        }
+        
+        // Check validation response
+        switch httpValidateResponse.statusCode {
+        case 200: break
+        case 400:
+            if let json = try? JSONSerialization.jsonObject(with: validateData) as? [String: Any],
+               let innerError = json["innererror"] as? [String: Any],
+               let code = innerError["code"] as? String,
+               code == "CatalogSkuDataNotFound" {
+                throw APIError.catalogNotFound
+            }
+            throw ActivationError.validationFailed
+        case 401: throw ActivationError.authenticationFailed
+        case 404: throw ActivationError.invalidKey
+        case 407:
+            // Proxy auth required - refresh credentials
+            await credentialsManager.clearCache()
+            throw ActivationError.proxyAuthenticationFailed
+        default: throw ActivationError.validationFailed
+        }
+        
+        let validationData = try JSONSerialization.jsonObject(with: validateData) as? [String: Any]
+        
+        if let tokenState = validationData?["tokenState"] as? String,
+           tokenState != "Active" {
+            throw ActivationError.keyStateInvalid(tokenState)
+        }
+        
+        // Step 2: Redeem
+        let redeemUrl = URL(string: "https://purchase.mp.microsoft.com/v7.0/users/me/orders")!
+        
+        var redeemRequest = URLRequest(url: redeemUrl)
+        redeemRequest.httpMethod = "POST"
+        redeemRequest.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
+        redeemRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let payload = createRedemptionPayload(key: key, market: market)
+        redeemRequest.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (redeemData, redeemResponse) = try await session.data(for: redeemRequest)
+        
+        try await handleRedemptionResponse(
+            response: redeemResponse,
+            data: redeemData,
+            key: key,
+            token: token,
+            region: market
+        )
+    }
+
+    // MARK: - Handle Redemption Response
+    private func handleRedemptionResponse(
+        response: URLResponse,
+        data: Data,
+        key: String,
+        token: String,
+        region: String
+    ) async throws {
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ActivationError.networkError
         }
         
+        devLog("[API] Redeem response status: \(httpResponse.statusCode)")
+        
         switch httpResponse.statusCode {
-        case 200:
-            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            let tokenState = json?["tokenState"] as? String ?? "Unknown"
+        case 200, 201:
+            // Success
+            return
             
-            return KeyValidationResult(
-                isValid: tokenState == "Active",
-                isAlreadyRedeemed: tokenState == "Redeemed" || tokenState == "AlreadyRedeemed",
-                tokenState: tokenState,
-                productInfo: json,
-                catalogError: false
-            )
-            
-        case 400:
-            // Check for catalog error
+        case 412:
+            // Conversion consent required
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let innerError = json["innererror"] as? [String: Any],
                let code = innerError["code"] as? String,
-               code == "CatalogSkuDataNotFound" {
-                return KeyValidationResult(
-                    isValid: false,
-                    isAlreadyRedeemed: false,
-                    tokenState: "CatalogError",
-                    productInfo: nil,
-                    catalogError: true
+               code == "ConversionConsentRequired" {
+                
+                devLog("[API] Conversion consent required, attempting UI automation flow")
+                
+                try await handleGamePassConversion(
+                    key: key,
+                    token: token,
+                    region: region
                 )
+                
+                devLog("[API] Game Pass conversion successful via UI automation")
+                return
             }
-            throw ActivationError.validationFailed
+            throw ActivationError.preconditionFailed
             
-        case 401:
-            throw ActivationError.authenticationFailed
+        case 403:
+            // Check specific errors
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let innerError = json["innererror"] as? [String: Any],
+                   let code = innerError["code"] as? String,
+                   code == "ActiveMarketMismatch" {
+                    throw APIError.marketMismatch
+                }
+                
+                if let errorCode = json["errorCode"] as? String,
+                   errorCode == "UserAlreadyOwnsContent",
+                   let products = json["data"] as? [String] {
+                    throw APIError.userAlreadyOwnsContent(products)
+                }
+            }
+            throw ActivationError.forbidden
             
-        case 404:
-            throw ActivationError.invalidKey
+        case 400:
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let errorCode = json["errorCode"] as? String {
+                switch errorCode {
+                case "TokenAlreadyRedeemed":
+                    throw ActivationError.alreadyRedeemed
+                case "InvalidToken":
+                    throw ActivationError.invalidKey
+                case "UserAlreadyOwnsContent":
+                    let products = json["data"] as? [String] ?? []
+                    throw APIError.userAlreadyOwnsContent(products)
+                default:
+                    throw ActivationError.badRequest(errorCode)
+                }
+            }
+            throw ActivationError.badRequest("Unknown")
             
         case 407:
-            // Proxy auth required - refresh credentials
+            // Proxy auth failed - refresh and retry
+            await credentialsManager.clearCache()
             throw ActivationError.proxyAuthenticationFailed
             
         default:
-            throw ActivationError.validationFailed
+            throw ActivationError.httpError(httpResponse.statusCode)
         }
     }
-    
-    // MARK: - Regional Key Redemption
-    private func redeemRegionalKey(
+
+    // MARK: - Game Pass Conversion (Matching Chrome Extension)
+    private func handleGamePassConversion(
         key: String,
         token: String,
-        region: String,
-        productId: String?
+        region: String
     ) async throws {
         
-        // Get proxy configuration
-        guard let proxyConfig = ProxyConfiguration.getConfig(for: region) else {
+        devLog("[Conversion] Starting Game Pass conversion flow with UI automation")
+        
+        // Create timeout task
+        let timeoutTask = Task {
+            try await Task.sleep(nanoseconds: UInt64(Constants.conversionTimeout * 1_000_000_000))
+            throw ActivationError.conversionTimeout
+        }
+        
+        defer {
+            timeoutTask.cancel()
+        }
+        
+        // Setup conversion webview if needed
+        if conversionWebView == nil {
+            await setupConversionWebView()
+        }
+        
+        guard let webView = conversionWebView else {
+            throw ActivationError.noWebView
+        }
+        
+        // Track conversion state
+        var conversionComplete = false
+        
+        // Inject conversion monitoring script
+        await injectConversionMonitor(webView: webView)
+        
+        // Load redeem page with key
+        let redeemUrl = URL(string: "https://account.microsoft.com/billing/redeem")!
+        webView.load(URLRequest(url: redeemUrl))
+        
+        // Wait for page to load
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        
+        // Execute conversion automation
+        let conversionScript = createConversionAutomationScript(key: key)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            self.conversionContinuation = continuation
+            
+            webView.evaluateJavaScript(conversionScript) { _, error in
+                if let error = error {
+                    devError("[Conversion] Script injection error: \(error)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Proxy Management (Matching Chrome Extension)
+    private func enableProxy(region: String, credentials: ProxyCredentials) async throws {
+        let targetRegion = region.uppercased()
+        guard let config = ProxyConfiguration.regions[targetRegion] else {
             throw ActivationError.unsupportedRegion
         }
         
-        // Get fresh credentials
-        let credentials = try await credentialsManager.getCredentials()
+        // Skip if already connected to same region
+        if activeProxy?.region == targetRegion {
+            devLog("[Proxy] Already connected to \(targetRegion)")
+            return
+        }
         
-        // Create proxy session
-        let session = try await createProxySession(
-            config: proxyConfig,
-            credentials: credentials
+        devLog("[Proxy] Connecting to \(targetRegion) \(config.host)")
+        
+        // Clear previous proxy
+        if activeProxy != nil {
+            await disableProxy()
+        }
+        
+        // Store active configuration
+        activeProxy = ActiveProxy(
+            region: targetRegion,
+            host: config.host,
+            port: config.port,
+            startTime: Date()
         )
         
-        defer { session.finishTasksAndInvalidate() }
+        // Setup auth handler
+        setupProxyAuthHandler(credentials: credentials)
+    }
+
+    private func disableProxy() async {
+        guard let proxy = activeProxy else { return }
         
-        // Try primary market first
+        devLog("[Proxy] Disconnecting")
+        
+        // Track usage for analytics
+        let duration = Date().timeIntervalSince(proxy.startTime)
+        trackProxyUsage(region: proxy.region, duration: duration)
+        
+        activeProxy = nil
+        cleanupAuthCache()
+    }
+
+    // MARK: - Form Hiding (Matching Chrome Extension)
+    private func enableFormHiding() async {
+        guard !formHidingEnabled else { return }
+        
+        devLog("[Form] Activating form hiding")
+        
+        guard let webView = hiddenWebView else { return }
+        
+        let script = """
+        document.body.setAttribute('data-exon-active', 'true');
+        """
+        
+        await webView.evaluateJavaScript(script) { _, _ in }
+        
+        formHidingEnabled = true
+    }
+
+    private func disableFormHiding() async {
+        guard formHidingEnabled else { return }
+        
+        devLog("[Form] Deactivating form hiding")
+        
+        guard let webView = hiddenWebView else { return }
+        
+        let script = """
+        document.body.removeAttribute('data-exon-active');
+        """
+        
+        await webView.evaluateJavaScript(script) { _, _ in }
+        
+        formHidingEnabled = false
+    }
+
+    // MARK: - Storage Management (Matching Chrome Extension addProductToStorage)
+    private func addProductToStorage(_ product: Product) async {
         do {
-            try await redeemKeyInMarket(
-                key: key,
-                token: token,
-                market: proxyConfig.market,
-                session: session,
-                productId: productId
-            )
-        } catch APIError.marketMismatch {
-            // Retry with US market
-            try await redeemKeyInMarket(
-                key: key,
-                token: token,
-                market: "US",
-                session: session,
-                productId: productId
-            )
+            let existingProducts = loadStoredProducts()
+            
+            // Check if product already exists based on session_token
+            if let existingIndex = existingProducts.firstIndex(where: {
+                $0.sessionToken == product.sessionToken
+            }) {
+                // Update existing product
+                var updatedProducts = existingProducts
+                updatedProducts[existingIndex] = product.withUpdatedTimestamp()
+                saveStoredProducts(updatedProducts)
+                devLog("[Storage] Updated existing product: \(product.sessionToken ?? "")")
+            } else {
+                // Add new product
+                var newProducts = existingProducts
+                newProducts.insert(product.withAddedTimestamp(), at: 0)
+                saveStoredProducts(newProducts)
+                devLog("[Storage] Added new product: \(product.sessionToken ?? "")")
+            }
+        } catch {
+            devError("[Storage] Failed to add/update product: \(error)")
         }
     }
-    
-    // MARK: - Global Key Redemption
-    private func redeemGlobalKey(
-        key: String,
-        token: String,
-        productId: String?
-    ) async throws {
-        
-        try await redeemKeyInMarket(
-            key: key,
-            token: token,
-            market: "US",
-            session: URLSession.shared,
-            productId: productId
-        )
+
+    private func loadStoredProducts() -> [Product] {
+        guard let data = UserDefaults.standard.data(forKey: "products"),
+              let products = try? JSONDecoder().decode([Product].self, from: data) else {
+            return []
+        }
+        return products
     }
-    
-    // MARK: - Market-specific Redemption
-    private func redeemKeyInMarket(
-        key: String,
-        token: String,
-        market: String,
-        session: URLSession,
-        productId: String?
-    ) async throws {
-        
-        let url = URL(string: "https://purchase.mp.microsoft.com/v7.0/users/me/orders")!
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("WLID1.0=\"\(token)\"", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
-        
-        let payload: [String: Any] = [
+
+    private func saveStoredProducts(_ products: [Product]) {
+        if let data = try? JSONEncoder().encode(products) {
+            UserDefaults.standard.set(data, forKey: "products")
+        }
+    }
+
+    // MARK: - Helper Methods
+    private func isKeyRedeemed(_ status: String?) -> Bool {
+        guard let status = status else { return false }
+        let redeemedStates = ["Redeemed", "AlreadyRedeemed", "Used", "Invalid", "Consumed", "Duplicate"]
+        return redeemedStates.contains { status.lowercased().contains($0.lowercased()) }
+    }
+
+    private func isGamePassProduct(_ product: Product) -> Bool {
+        if let productId = product.productId {
+            return Constants.gamePassProductIds.contains(productId)
+        }
+        return false
+    }
+
+    private func verifyVendorForCurrentPage(_ vendor: String) -> (valid: Bool, expected: String?) {
+        // Since this is iOS app, we always accept Microsoft Store/Xbox vendors
+        let acceptedVendors = ["Microsoft Store", "Xbox"]
+        let valid = acceptedVendors.contains(vendor) || vendor.isEmpty
+        return (valid: valid, expected: valid ? nil : "Microsoft Store")
+    }
+
+    private func createRedemptionPayload(key: String, market: String) -> [String: Any] {
+        return [
             "orderId": UUID().uuidString,
             "orderState": "Purchased",
             "billingInformation": [
@@ -737,217 +1072,11 @@ final class ActivationManager: NSObject, ObservableObject {
             "market": market,
             "orderAdditionalMetadata": nil
         ]
-        
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        let (data, response) = try await session.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ActivationError.networkError
-        }
-        
-        try handleRedemptionResponse(
-            statusCode: httpResponse.statusCode,
-            data: data
-        )
     }
-    
-    // MARK: - Handle Redemption Response
-    private func handleRedemptionResponse(
-        statusCode: Int,
-        data: Data
-    ) throws {
-        
-        switch statusCode {
-        case 200, 201:
-            // Success
-            return
-            
-        case 412:
-            // Precondition Failed - Check for conversion
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let innerError = json["innererror"] as? [String: Any],
-               let code = innerError["code"] as? String,
-               code == "ConversionConsentRequired" {
-                throw APIError.conversionConsentRequired
-            }
-            throw ActivationError.activationFailed
-            
-        case 403:
-            // Forbidden - Check specific errors
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                // Check for market mismatch
-                if let innerError = json["innererror"] as? [String: Any],
-                   let code = innerError["code"] as? String,
-                   code == "ActiveMarketMismatch" {
-                    throw APIError.marketMismatch
-                }
-                
-                // Check for already owned
-                if let errorCode = json["errorCode"] as? String,
-                   errorCode == "UserAlreadyOwnsContent" {
-                    var ownedProducts: [String] = []
-                    if let products = json["data"] as? [String] {
-                        ownedProducts = products
-                    }
-                    throw APIError.userAlreadyOwnsContent(ownedProducts)
-                }
-                
-                // Region restriction
-                if let errorCode = json["errorCode"] as? String,
-                   errorCode == "RegionRestricted" {
-                    throw ActivationError.regionRestricted
-                }
-            }
-            throw ActivationError.forbidden
-            
-        case 409:
-            // Conflict - Already redeemed
-            throw ActivationError.alreadyRedeemed
-            
-        case 400:
-            // Bad Request
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if let errorCode = json["errorCode"] as? String {
-                    switch errorCode {
-                    case "TokenAlreadyRedeemed":
-                        throw ActivationError.alreadyRedeemed
-                    case "InvalidToken":
-                        throw ActivationError.invalidKey
-                    case "InvalidMarket":
-                        throw APIError.marketMismatch
-                    default:
-                        throw ActivationError.badRequest(errorCode)
-                    }
-                }
-            }
-            throw ActivationError.badRequest("Unknown")
-            
-        case 401:
-            // Unauthorized
-            throw ActivationError.authenticationFailed
-            
-        case 407:
-            // Proxy Authentication Required
-            throw ActivationError.proxyAuthenticationFailed
-            
-        case 500, 502, 503, 504:
-            // Server errors
-            throw APIError.serverError(statusCode)
-            
-        default:
-            throw ActivationError.httpError(statusCode)
-        }
-    }
-    
-    // MARK: - Game Pass Conversion Handler
-    private func handleGamePassConversion(
-        key: String,
-        token: String,
-        region: String
-    ) async throws {
-        
-        await MainActor.run {
-            self.activationState = .handlingConversion
-        }
-        
-        // Create conversion webview if needed
-        if conversionWebView == nil {
-            await setupConversionWebView()
-        }
-        
-        guard let webView = conversionWebView else {
-            throw ActivationError.conversionFailed
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
-            self.conversionContinuation = continuation
-            
-            // Inject conversion automation script
-            let script = createConversionAutomationScript(key: key)
-            webView.evaluateJavaScript(script) { _, error in
-                if let error = error {
-                    print("[Conversion] Script injection error: \(error)")
-                }
-            }
-            
-            // Load redemption page
-            let url = URL(string: "https://account.microsoft.com/billing/redeem")!
-            webView.load(URLRequest(url: url))
-            
-            // Set timeout
-            Task {
-                try await Task.sleep(nanoseconds: UInt64(Constants.conversionTimeout * 1_000_000_000))
-                if self.conversionContinuation != nil {
-                    self.conversionContinuation?.resume(throwing: ActivationError.conversionTimeout)
-                    self.conversionContinuation = nil
-                }
-            }
-        }
-    }
-    
-    // MARK: - Token Capture with Retry
-    private func captureMicrosoftTokenWithRetry() async throws -> String {
-        tokenRetryCount = 0
-        
-        return try await networkManager.executeWithExponentialBackoff(
-            maxAttempts: Constants.maxTokenRetries,
-            initialDelay: 1.0,
-            maxDelay: 4.0,
-            jitter: false
-        ) {
-            self.tokenRetryCount += 1
-            return try await self.captureMicrosoftToken()
-        }
-    }
-    
-    // MARK: - Token Capture Implementation
-    private func captureMicrosoftToken() async throws -> String {
-        guard let webView = hiddenWebView else {
-            throw ActivationError.noWebView
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
-            self.tokenContinuation = continuation
-            
-            // Check if already on Microsoft account page
-            if let currentURL = webView.url,
-               Constants.microsoftDomains.contains(where: { currentURL.host?.contains($0) ?? false }) {
-                // Try immediate capture
-                webView.evaluateJavaScript("window.ExonTokenCapture.captureToken()") { _, error in
-                    if let error = error {
-                        print("[Token] Immediate capture error: \(error)")
-                        // Load page if capture fails
-                        let url = URL(string: "https://account.microsoft.com/")!
-                        webView.load(URLRequest(url: url))
-                    }
-                }
-            } else {
-                // Load Microsoft account page
-                let url = URL(string: "https://account.microsoft.com/")!
-                webView.load(URLRequest(url: url))
-            }
-            
-            // Set timeout
-            Task {
-                try await Task.sleep(nanoseconds: UInt64(Constants.tokenTimeout * 1_000_000_000))
-                if self.tokenContinuation != nil {
-                    self.tokenContinuation?.resume(throwing: ActivationError.tokenTimeout)
-                    self.tokenContinuation = nil
-                }
-            }
-        }
-    }
-    
-    // MARK: - Proxy Session Creation
-    private func createProxySession(
-        config: ProxyConfiguration,
-        credentials: ProxyCredentials
-    ) async throws -> URLSession {
-        
+
+    private func createProxySession(config: ProxyConfiguration, credentials: ProxyCredentials) -> URLSession {
         let sessionConfig = URLSessionConfiguration.ephemeral
         
-        // Set proxy
         sessionConfig.connectionProxyDictionary = [
             kCFNetworkProxiesHTTPEnable: true,
             kCFNetworkProxiesHTTPProxy: config.host,
@@ -959,53 +1088,57 @@ final class ActivationManager: NSObject, ObservableObject {
             kCFProxyPasswordKey: credentials.password
         ] as [String: Any]
         
-        // Set timeouts
         sessionConfig.timeoutIntervalForRequest = 10
         sessionConfig.timeoutIntervalForResource = 30
         
-        // Create delegate for auth challenges
-        let delegate = ProxyAuthenticationDelegate(
-            credentials: credentials,
-            maxRetries: Constants.maxProxyAuthRetries
+        return URLSession(configuration: sessionConfig)
+    }
+
+    // MARK: - Cache Management
+    private func getTokenFromCache() -> String? {
+        guard let entry = tokenCache[UIDevice.current.identifierForVendor?.uuidString ?? ""],
+              entry.expires > Date() else {
+            return nil
+        }
+        return entry.token
+    }
+
+    private func cacheToken(_ token: String) {
+        let key = UIDevice.current.identifierForVendor?.uuidString ?? ""
+        tokenCache[key] = TokenCacheEntry(
+            token: token,
+            expires: Date().addingTimeInterval(Constants.tokenCacheDuration)
         )
         
-        return URLSession(
-            configuration: sessionConfig,
-            delegate: delegate,
-            delegateQueue: nil
-        )
+        // Cleanup old entries
+        cleanupTokenCache()
     }
-    
-    // MARK: - Helper Methods
-    private func isKeyRedeemed(_ status: String) -> Bool {
-        let redeemedStates = ["Redeemed", "AlreadyRedeemed", "Used", "Invalid", "Consumed", "Duplicate"]
-        return redeemedStates.contains(where: { status.lowercased().contains($0.lowercased()) })
+
+    private func cleanupTokenCache() {
+        let now = Date()
+        tokenCache = tokenCache.filter { $0.value.expires > now }
     }
-    
-    private func isGamePassProduct(_ product: Product) -> Bool {
-        if let productId = product.productId {
-            return Constants.gamePassProductIds.contains(productId)
-        }
-        return product.isGamePass == true
+
+    private func cleanupAuthCache() {
+        let now = Date()
+        authCache = authCache.filter { $0.value.expires > now }
     }
-    
-    private func calculateBundleKeyDelay(index: Int, hasFailures: Bool) -> TimeInterval {
-        // Base delay
-        var delay = Constants.bundleKeyDelay
-        
-        // Increase delay if there are failures
-        if hasFailures {
-            delay += 2.0
-        }
-        
-        // Add jitter
-        let jitter = Double.random(in: -0.5...0.5)
-        delay += jitter
-        
-        return max(delay, 1.0)
+
+    // MARK: - Analytics
+    private func trackProxyUsage(region: String, duration: TimeInterval) {
+        devLog("[Analytics] Proxy usage: region=\(region), duration=\(duration)s")
     }
-    
-    // MARK: - Reset State
+
+    // MARK: - Cleanup
+    private func performCleanup() async {
+        await disableProxy()
+        await disableFormHiding()
+        cleanupAuthCache()
+        cleanupTokenCache()
+        pendingRequests.removeAll()
+    }
+
+    // MARK: - State Reset
     private func resetState() async {
         await MainActor.run {
             self.isActivating = false
@@ -1015,14 +1148,11 @@ final class ActivationManager: NSObject, ObservableObject {
             self.activationProgress = 0.0
             self.bundleProgress = nil
             self.bundleState = nil
-            self.pendingActivation = nil
             self.formHidingEnabled = false
             
             // Clear retry counts
             self.tokenRetryCount = 0
             self.proxyAuthRetryCount.removeAll()
-            self.keyValidationRetryCount.removeAll()
-            self.keyRedemptionRetryCount.removeAll()
         }
         
         // Clear continuations
@@ -1031,94 +1161,194 @@ final class ActivationManager: NSObject, ObservableObject {
         conversionContinuation?.resume(throwing: ActivationError.cancelled)
         conversionContinuation = nil
     }
-}
 
-// MARK: - Bundle State Management
-final class BundleActivationState {
-    
-    struct KeyState {
-        let key: String
-        var status: KeyStatus
-        var attempts: Int = 0
-        var lastError: Error?
-        var lastAttemptTime: Date?
-        var marketsAttempted: [String] = []
+    // MARK: - Error Handling
+    private func handleActivationError(_ error: Error) async {
+        devError("[Activation] Error: \(error)")
         
-        enum KeyStatus: Equatable {
-            case pending
-            case validating
-            case redeeming
-            case conversionRequired
-            case succeeded
-            case failed(reason: String)
-            case alreadyOwned(products: [String])
-            case alreadyRedeemed
-        }
-    }
-    
-    private var keyStates: [String: KeyState] = [:]
-    private var successfulKeys: Set<String> = []
-    private var failedKeys: Set<String> = []
-    private var recoverableFailures: Set<String> = []
-    
-    init(keys: [String]) {
-        for key in keys {
-            keyStates[key] = KeyState(key: key, status: .pending)
-        }
-    }
-    
-    func updateKeyState(_ key: String, state: KeyState.KeyStatus) {
-        keyStates[key]?.status = state
-        keyStates[key]?.lastAttemptTime = Date()
-    }
-    
-    func recordSuccess(key: String) {
-        successfulKeys.insert(key)
-        failedKeys.remove(key)
-        recoverableFailures.remove(key)
-    }
-    
-    func recordFailure(key: String, error: Error, isRecoverable: Bool) {
-        failedKeys.insert(key)
-        if isRecoverable {
-            recoverableFailures.insert(key)
-        }
-        keyStates[key]?.lastError = error
-        keyStates[key]?.attempts += 1
-    }
-    
-    func isKeySuccessful(_ key: String) -> Bool {
-        return successfulKeys.contains(key)
-    }
-    
-    func hasFailures() -> Bool {
-        return !failedKeys.isEmpty
-    }
-    
-    func getRecoverableFailures() -> [String] {
-        return Array(recoverableFailures)
-    }
-    
-    func getAllResults() -> BundleResults {
-        var succeeded: [String] = []
-        var failed: [(key: String, status: KeyState.KeyStatus, error: Error?)] = []
+        let errorMessage: String
         
-        for (key, state) in keyStates {
-            switch state.status {
-            case .succeeded:
-                succeeded.append(key)
-            case .failed, .alreadyOwned, .alreadyRedeemed:
-                failed.append((key, state.status, state.lastError))
+        if let activationError = error as? ActivationError {
+            errorMessage = activationError.localizedDescription
+        } else if let apiError = error as? APIError {
+            errorMessage = apiError.localizedDescription
+        } else {
+            errorMessage = error.localizedDescription
+        }
+        
+        await MainActor.run {
+            self.errorMessage = errorMessage
+            self.activationState = .error(errorMessage)
+            self.isActivating = false
+        }
+    }
+
+    // MARK: - Mark As Activated (Matching Chrome Extension)
+    private func markAsActivated(sessionToken: String, success: Bool) async throws {
+        let url = URL(string: "\(Config.supabase.url)/functions/v1/mark-activated")!
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(Config.supabase.anonKey)", forHTTPHeaderField: "Authorization")
+        
+        let body: [String: Any] = [
+            "success": success,
+            "session_token": sessionToken
+        ]
+        
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        let (_, response) = try await URLSession.shared.data(for: request)
+        
+        if let httpResponse = response as? HTTPURLResponse,
+           httpResponse.statusCode == 200 {
+            devLog("[Activation] Key successfully marked as activated")
+        } else {
+            devError("[Activation] Failed to mark key as activated")
+        }
+    }
+    
+    // MARK: - WebView Setup Methods
+    private func setupWebViews() {
+        setupHiddenWebView()
+        setupConversionWebView()
+    }
+
+    private func setupHiddenWebView() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        
+        // Add scripts
+        configuration.userContentController.addUserScript(WebViewScripts.createTokenCaptureScript())
+        configuration.userContentController.addUserScript(WebViewScripts.createFormHidingScript())
+        configuration.userContentController.addUserScript(WebViewScripts.createURLMonitorScript())
+        
+        // Add message handlers
+        configuration.userContentController.add(self, name: "tokenCapture")
+        configuration.userContentController.add(self, name: "urlMonitor")
+        
+        hiddenWebView = WKWebView(frame: .zero, configuration: configuration)
+        hiddenWebView?.navigationDelegate = self
+        
+        // Load Microsoft account page
+        let url = URL(string: "https://account.microsoft.com/")!
+        hiddenWebView?.load(URLRequest(url: url))
+    }
+
+    private func setupConversionWebView() {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        
+        // Add conversion scripts
+        configuration.userContentController.addUserScript(WebViewScripts.createConversionMonitorScript())
+        
+        // Add message handler
+        configuration.userContentController.add(self, name: "conversionHandler")
+        
+        conversionWebView = WKWebView(frame: .zero, configuration: configuration)
+        conversionWebView?.navigationDelegate = self
+    }
+
+    private func injectConversionMonitor(webView: WKWebView) async {
+        let script = WebViewScripts.createConversionMonitorScript().source
+        _ = try? await webView.evaluateJavaScript(script)
+    }
+
+    private func setupProxyAuthHandler(credentials: ProxyCredentials) {
+        // Implementation handled through URLSession proxy configuration
+        // No additional setup needed as proxy auth is handled in createProxySession
+    }
+
+    private func setupCleanupTimer() {
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            Task { @MainActor in
+                self.cleanupAuthCache()
+                self.cleanupTokenCache()
+            }
+        }
+    }
+    
+    // MARK: - WKNavigationDelegate
+    extension ActivationManager: WKNavigationDelegate {
+        nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Handle page load completion if needed
+        }
+        
+        nonisolated func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            decisionHandler(.allow)
+        }
+    }
+
+    // MARK: - WKScriptMessageHandler
+    extension ActivationManager: WKScriptMessageHandler {
+        nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            Task { @MainActor in
+                switch message.name {
+                case "tokenCapture":
+                    handleTokenCaptureMessage(message.body)
+                    
+                case "conversionHandler":
+                    handleConversionMessage(message.body)
+                    
+                case "urlMonitor":
+                    handleURLMonitorMessage(message.body)
+                    
+                default:
+                    break
+                }
+            }
+        }
+        
+        @MainActor
+        private func handleTokenCaptureMessage(_ body: Any) {
+            guard let dict = body as? [String: Any],
+                  let success = dict["success"] as? Bool else {
+                return
+            }
+            
+            if success, let token = dict["token"] as? String {
+                tokenContinuation?.resume(returning: token)
+            } else {
+                let error = dict["error"] as? String ?? "Unknown error"
+                tokenContinuation?.resume(throwing: ActivationError.tokenCaptureFailed(error))
+            }
+            tokenContinuation = nil
+        }
+        
+        @MainActor
+        private func handleConversionMessage(_ body: Any) {
+            guard let dict = body as? [String: Any],
+                  let type = dict["type"] as? String else {
+                return
+            }
+            
+            switch type {
+            case "success":
+                conversionContinuation?.resume(returning: true)
+                conversionContinuation = nil
+                
+            case "redeemToken":
+                if let success = dict["success"] as? Bool, success {
+                    conversionContinuation?.resume(returning: true)
+                    conversionContinuation = nil
+                }
+                
             default:
                 break
             }
         }
         
-        return BundleResults(succeeded: succeeded, failed: failed)
-    }
-    
-    struct BundleResults {
-        let succeeded: [String]
-        let failed: [(key: String, status: KeyState.KeyStatus, error: Error?)]
+        @MainActor
+        private func handleURLMonitorMessage(_ body: Any) {
+            guard let dict = body as? [String: Any],
+                  let url = dict["url"] as? String,
+                  dict["isRedeemPage"] as? Bool == true else {
+                return
+            }
+            
+            // Handle URL change if needed
+            devLog("[URLMonitor] Redeem page detected: \(url)")
+        }
     }
 }

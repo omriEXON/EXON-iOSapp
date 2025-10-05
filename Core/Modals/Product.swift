@@ -2,72 +2,70 @@ import Foundation
 
 struct Product: Codable, Identifiable {
     let id: String
-    let productName: String
-    let productImage: String?
+    var sessionToken: String?
     let productKey: String?
     let productKeys: [String]?
     let region: String
-    let sessionToken: String?
+    let productName: String
+    let productImage: String?
+    let productId: String?
     let vendor: String?
     let status: String?
-    let isGamePass: Bool?
     let isBundle: Bool
     let activationMethod: String?
     let orderNumber: String?
-    let portalUrl: String?
-    let productId: String?
+    var portalUrl: String?
+    let orderId: String?
     let expiresAt: Date?
+    let isTestMode: Bool
     var addedAt: Date?
     var updatedAt: Date?
     
-    enum CodingKeys: String, CodingKey {
-        case id
-        case productName = "product_name"
-        case productImage = "product_image"
-        case productKey = "product_key"
-        case productKeys = "product_keys"
-        case region
-        case sessionToken = "session_token"
-        case vendor
-        case status
-        case isGamePass = "is_game_pass"
-        case isBundle = "is_bundle"
-        case activationMethod = "activation_method"
-        case orderNumber = "order_number"
-        case portalUrl = "portal_url"
-        case productId = "product_id"
-        case expiresAt = "expires_at"
-        case addedAt = "added_at"
-        case updatedAt = "updated_at"
+    // Add computed properties
+    var isGamePass: Bool {
+        guard let productId = productId else { return false }
+        return ["CFQ7TTC0K5DJ", "CFQ7TTC0KHS0"].contains(productId)
     }
     
-    var allKeys: [String] {
-        if let keys = productKeys, !keys.isEmpty {
-            return keys
-        } else if let key = productKey {
-            return [key]
-        }
-        return []
-    }
-    
-    init(from activation: PendingActivation) {
-        self.id = UUID().uuidString
-        self.productName = activation.productName
-        self.productImage = activation.productImage
-        self.productKey = activation.productKey
-        self.productKeys = activation.productKeys
-        self.region = activation.region
-        self.sessionToken = activation.sessionToken
-        self.vendor = activation.vendor ?? "Microsoft Store"
-        self.status = "pending"
-        self.isGamePass = false
-        self.isBundle = (activation.productKeys?.count ?? 0) > 1
-        self.activationMethod = activation.activationMethod
-        self.orderNumber = activation.orderNumber
-        self.portalUrl = activation.portalUrl
-        self.productId = nil
-        self.expiresAt = nil
-        self.addedAt = Date()
-        self.updatedAt = Date()
+    init(
+        id: String = UUID().uuidString,
+        sessionToken: String? = nil,
+        productKey: String? = nil,
+        productKeys: [String]? = nil,
+        region: String,
+        productName: String,
+        productImage: String? = nil,
+        productId: String? = nil,
+        vendor: String? = "Microsoft Store",
+        status: String? = nil,
+        isBundle: Bool = false,
+        activationMethod: String? = nil,
+        orderNumber: String? = nil,
+        portalUrl: String? = nil,
+        orderId: String? = nil,
+        expiresAt: Date? = nil,
+        isTestMode: Bool = false,
+        addedAt: Date? = nil,
+        updatedAt: Date? = nil
+    ) {
+        self.id = id
+        self.sessionToken = sessionToken
+        self.productKey = productKey
+        self.productKeys = productKeys
+        self.region = region
+        self.productName = productName
+        self.productImage = productImage
+        self.productId = productId
+        self.vendor = vendor
+        self.status = status
+        self.isBundle = isBundle
+        self.activationMethod = activationMethod
+        self.orderNumber = orderNumber
+        self.portalUrl = portalUrl
+        self.orderId = orderId
+        self.expiresAt = expiresAt
+        self.isTestMode = isTestMode
+        self.addedAt = addedAt
+        self.updatedAt = updatedAt
     }
 }

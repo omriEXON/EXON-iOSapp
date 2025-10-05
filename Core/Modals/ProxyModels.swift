@@ -1,5 +1,22 @@
 import Foundation
 
+struct ActiveProxy {
+    let region: String
+    let host: String
+    let port: Int
+    let startTime: Date
+}
+
+struct AuthCacheEntry {
+    let credentials: URLCredential
+    let expires: Date
+}
+
+struct TokenCacheEntry {
+    let token: String
+    let expires: Date
+}
+
 struct ProxyCredentials: Codable {
     let username: String
     let password: String
